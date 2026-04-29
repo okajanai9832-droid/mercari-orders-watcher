@@ -1,14 +1,11 @@
 // src/mercari.js
-// メルカリ検索 (Stealth強化版)
-// playwright-extra + stealth plugin で Bot検出を回避
+// メルカリ検索 (Stealth + 価格抽出デバッグ強化版)
 
 import { chromium as chromiumExtra } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
-// Stealth pluginを有効化 (navigator.webdriver, plugins, languages 等を偽装)
 chromiumExtra.use(StealthPlugin());
 
-// 最新の実Chromeに近いUA
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/131.0.6778.205 Safari/537.36';
 
@@ -30,14 +27,12 @@ export async function searchMercariMulti(keywords, maxPrice) {
       viewport: { width: 1366, height: 768 },
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo',
-      // 日本のユーザーらしく見せる
       extraHTTPHeaders: {
         'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       },
     });
 
-    // navigator系のフィンガープリント偽装
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en'] });
@@ -64,7 +59,6 @@ export async function searchMercariMulti(keywords, maxPrice) {
             allItems.set(item.id, item);
           }
         }
-        // 人間らしい間隔 (1.5〜3秒のランダム)
         const wait = 1500 + Math.random() * 1500;
         await new Promise(r => setTimeout(r, wait));
       } catch (err) {
@@ -90,17 +84,12 @@ async function searchOne(context, keyword, maxPrice, debug = false) {
 
   const page = await context.newPage();
   try {
-    // Refererを設定して自然なナビゲーションに見せる
     await page.setExtraHTTPHeaders({
       'Referer': 'https://jp.mercari.com/',
     });
 
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    
-    // 商品リンクが描画されるまで最大15秒待つ
     await page.waitForSelector('a[href*="/item/"]', { timeout: 15000 }).catch(() => {});
-
-    // 少し追加で待機 (動的描画の遅延を吸収)
     await page.waitForTimeout(1500);
 
     if (debug) {
@@ -143,10 +132,24 @@ async function searchOne(context, keyword, maxPrice, debug = false) {
         const innerText = a.innerText || '';
         const title = ariaLabel || innerText.split('\n')[0] || '';
 
+        // 価格抽出: 複数パターン対応
         let price = 0;
-        const priceMatch = (ariaLabel + ' ' + innerText).match(/([\d,]+)\s*円/);
-        if (priceMatch) {
-          price = parseInt(priceMatch[1].replace(/,/g, ''), 10);
+        // パターン1: aria-label内の「1,500円」「¥1,500」
+        const allText = ariaLabel + ' ' + innerText;
+        const priceMatch1 = allText.match(/[¥￥]\s*([\d,]+)/);
+        const priceMatch2 = allText.match(/([\d,]+)\s*円/);
+        if (priceMatch1) {
+          price = parseInt(priceMatch1[1].replace(/,/g, ''), 10);
+        } else if (priceMatch2) {
+          price = parseInt(priceMatch2[1].replace(/,/g, ''), 10);
+        }
+        // パターン3: 子要素のtextContentからも探す
+        if (price === 0) {
+          const allTextContent = a.textContent || '';
+          const m3 = allTextContent.match(/[¥￥]\s*([\d,]+)/) || allTextContent.match(/([\d,]+)\s*円/);
+          if (m3) {
+            price = parseInt(m3[1].replace(/,/g, ''), 10);
+          }
         }
 
         const img = a.querySelector('img');
@@ -158,10 +161,22 @@ async function searchOne(context, keyword, maxPrice, debug = false) {
           price,
           imageUrl,
           url: `https://jp.mercari.com/item/${id}`,
+          rawText: (ariaLabel + ' | ' + innerText).slice(0, 200), // デバッグ用
         });
       }
       return results;
     });
+
+    // デバッグ: フィルタ前の取得内容を表示 (最初のクエリのみ)
+    if (debug) {
+      console.log(`  [DEBUG] フィルタ前 取得${items.length}件:`);
+      items.slice(0, 5).forEach((item, i) => {
+        console.log(`    ${i + 1}. id=${item.id} price=${item.price} title="${item.title.slice(0, 40)}"`);
+        console.log(`       raw: ${item.rawText.slice(0, 100)}`);
+      });
+      const filtered = items.filter(it => it.price > 0 && it.price <= maxPrice);
+      console.log(`  [DEBUG] フィルタ後: ${filtered.length}件 (price>0 かつ <=${maxPrice})`);
+    }
 
     return items.filter(item => item.price > 0 && item.price <= maxPrice);
 
