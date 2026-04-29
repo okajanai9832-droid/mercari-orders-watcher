@@ -1,33 +1,50 @@
 // src/mercari.js
-// メルカリ検索スクレイパー (Playwright)
+// メルカリ検索 (Stealth強化版)
+// playwright-extra + stealth plugin で Bot検出を回避
 
-import { chromium } from 'playwright';
+import { chromium as chromiumExtra } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 
+// Stealth pluginを有効化 (navigator.webdriver, plugins, languages 等を偽装)
+chromiumExtra.use(StealthPlugin());
+
+// 最新の実Chromeに近いUA
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/131.0.6778.205 Safari/537.36';
 
-/**
- * メルカリで検索 (出品中・新着順・価格上限フィルタ)
- * @param {Array<string>} keywords - 検索クエリ配列
- * @param {number} maxPrice - 価格上限 (円)
- * @returns {Promise<Array<{id, title, price, imageUrl, url}>>}
- */
 export async function searchMercariMulti(keywords, maxPrice) {
-  const browser = await chromium.launch({
+  const browser = await chromiumExtra.launch({
     headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--no-sandbox',
+    ],
   });
 
-  const allItems = new Map(); // 重複排除のためMap (id → item)
+  const allItems = new Map();
 
   try {
     const context = await browser.newContext({
       userAgent: USER_AGENT,
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 1366, height: 768 },
       locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      // 日本のユーザーらしく見せる
+      extraHTTPHeaders: {
+        'Accept-Language': 'ja-JP,ja;q=0.9,en;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      },
     });
 
-    // 静的リソースをブロックして高速化
+    // navigator系のフィンガープリント偽装
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja', 'en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      window.chrome = { runtime: {} };
+    });
+
     await context.route('**/*', (route) => {
       const type = route.request().resourceType();
       if (['image', 'media', 'font'].includes(type)) {
@@ -37,16 +54,19 @@ export async function searchMercariMulti(keywords, maxPrice) {
       }
     });
 
+    let firstQuery = true;
     for (const keyword of keywords) {
       try {
-        const items = await searchOne(context, keyword, maxPrice);
+        const items = await searchOne(context, keyword, maxPrice, firstQuery);
+        firstQuery = false;
         for (const item of items) {
           if (!allItems.has(item.id)) {
             allItems.set(item.id, item);
           }
         }
-        // クエリ間スリープ (メルカリへの負荷軽減)
-        await new Promise(r => setTimeout(r, 1500));
+        // 人間らしい間隔 (1.5〜3秒のランダム)
+        const wait = 1500 + Math.random() * 1500;
+        await new Promise(r => setTimeout(r, wait));
       } catch (err) {
         console.error(`  [検索エラー] "${keyword}":`, err.message);
       }
@@ -58,7 +78,7 @@ export async function searchMercariMulti(keywords, maxPrice) {
   return Array.from(allItems.values());
 }
 
-async function searchOne(context, keyword, maxPrice) {
+async function searchOne(context, keyword, maxPrice, debug = false) {
   const params = new URLSearchParams({
     keyword: keyword,
     status: 'on_sale',
@@ -70,11 +90,44 @@ async function searchOne(context, keyword, maxPrice) {
 
   const page = await context.newPage();
   try {
+    // Refererを設定して自然なナビゲーションに見せる
+    await page.setExtraHTTPHeaders({
+      'Referer': 'https://jp.mercari.com/',
+    });
+
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForSelector('a[href^="/item/m"]', { timeout: 12000 }).catch(() => {});
+    
+    // 商品リンクが描画されるまで最大15秒待つ
+    await page.waitForSelector('a[href*="/item/"]', { timeout: 15000 }).catch(() => {});
+
+    // 少し追加で待機 (動的描画の遅延を吸収)
+    await page.waitForTimeout(1500);
+
+    if (debug) {
+      const debugInfo = await page.evaluate(() => {
+        return {
+          title: document.title,
+          htmlSize: document.documentElement.outerHTML.length,
+          allLinks: document.querySelectorAll('a').length,
+          itemLinksA: document.querySelectorAll('a[href^="/item/m"]').length,
+          itemLinksB: document.querySelectorAll('a[href*="/item/"]').length,
+          bodyStart: document.body.innerText.slice(0, 300),
+        };
+      });
+      console.log(`  [DEBUG] URL: ${searchUrl}`);
+      console.log(`  [DEBUG] title: ${debugInfo.title}`);
+      console.log(`  [DEBUG] HTMLサイズ: ${debugInfo.htmlSize}`);
+      console.log(`  [DEBUG] aタグ全数: ${debugInfo.allLinks}`);
+      console.log(`  [DEBUG] /item/m リンク: ${debugInfo.itemLinksA}`);
+      console.log(`  [DEBUG] /item/ リンク: ${debugInfo.itemLinksB}`);
+      console.log(`  [DEBUG] body冒頭: ${debugInfo.bodyStart.slice(0, 150)}`);
+    }
 
     const items = await page.evaluate(() => {
-      const anchors = Array.from(document.querySelectorAll('a[href^="/item/m"]'));
+      let anchors = Array.from(document.querySelectorAll('a[href^="/item/m"]'));
+      if (anchors.length === 0) {
+        anchors = Array.from(document.querySelectorAll('a[href*="/item/"]'));
+      }
       const results = [];
       const seen = new Set();
 
